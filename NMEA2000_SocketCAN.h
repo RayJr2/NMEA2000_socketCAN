@@ -36,6 +36,7 @@ Inherited NMEA2000 object for socketCAN setup. See also NMEA2000 library.
 #define NMEA2000_SOCKETCAN_H_
 
 #include <stdio.h>
+#include <string>
 #include <NMEA2000.h>
 #include <N2kMsg.h>
 
@@ -55,10 +56,21 @@ protected:
     int   skt;
     char*  _CANport;
 
+private:
+    std::string CANportStorage;
+    tNMEA2000_SocketCAN(const tNMEA2000_SocketCAN&) = delete;
+    tNMEA2000_SocketCAN& operator=(const tNMEA2000_SocketCAN&) = delete;
+
 
 public:
     tNMEA2000_SocketCAN(char* CANport=NULL);
-    void     SetCANport(char *CANport=NULL);                // If used, must be called before CANOpen() 
+    // The core has no virtual destructor: never delete through tNMEA2000*.
+    ~tNMEA2000_SocketCAN();
+    // Closes only the Linux transport, not core state or queued messages.
+    // False reports close(2) failure via errno; Linux descriptors are not retried.
+    bool Close();
+    // Copies the name while closed; NULL is unchanged. While open: errno=EBUSY.
+    void     SetCANport(char *CANport=NULL);
 
 };
 

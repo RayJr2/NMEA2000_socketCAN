@@ -40,6 +40,7 @@ See also NMEA2000 library.
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <net/if.h>
@@ -47,77 +48,63 @@ See also NMEA2000 library.
 #include <linux/can/raw.h>
 
 //*****************************************************************************
-//  Pass in pointer to character array which contains (or will contain) the
-//  string of the CANsocket to use in :open().   If no paramater is passed in,
-//  or NULL is passed in, the defalt socket 'can0' will be used
-tNMEA2000_SocketCAN::tNMEA2000_SocketCAN(char* CANport) : tNMEA2000()
-{
-    static char defaultCANport[] = "can0";
-
-    if (CANport != NULL)
-        _CANport = CANport;
-    else
-        _CANport = defaultCANport;                                                 // NULL passed in, set to port to default: CAN0
-
+//  Copy the interface name. NULL selects the historical default can0.
+//  Caller storage need not remain alive after construction.
+tNMEA2000_SocketCAN::tNMEA2000_SocketCAN(char* CANport)
+    : tNMEA2000(), skt(-1), _CANport(NULL),
+      CANportStorage(CANport ? CANport : "can0") {
+    _CANport = const_cast<char*>(CANportStorage.c_str());
 }
 
+tNMEA2000_SocketCAN::~tNMEA2000_SocketCAN() {
+    Close();
+}
 
+bool tNMEA2000_SocketCAN::Close() {
+    if (skt < 0) return true;
+    const int fd = skt;
+    skt = -1;
+    // On Linux close releases the descriptor even when later cleanup fails.
+    // Retrying could close an unrelated descriptor reused by another thread.
+    return ::close(fd) == 0;
+}
 
-//*****************************************************************************
 void tNMEA2000_SocketCAN::SetCANport(char *CANport) {
-    if (CANport != NULL)
-       _CANport = CANport;
+    if (!CANport) return;
+    if (skt >= 0) { errno = EBUSY; return; }
+    CANportStorage = CANport;
+    _CANport = const_cast<char*>(CANportStorage.c_str());
 }
 
-
-
-//*****************************************************************************
 bool tNMEA2000_SocketCAN::CANOpen() {
-    struct ifreq ifr;
-    struct sockaddr_can addr;
-    int flags;
-
-    //----  Open a socket to the CAN port
-    skt = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if(skt < 0) {
-        cerr << "Failed open CAN socket: " << _CANport << endl;
-        return (false);
-        }
-
-    strncpy(ifr.ifr_name, _CANport, (sizeof(ifr.ifr_name)-1));
-    ifr.ifr_name[sizeof(ifr.ifr_name)-1] = '\0';                                          //  (And make sure to null terminate)
-
-    if (ioctl(skt, SIOCGIFINDEX, &ifr) < 0) {
-        cerr << "Failed CAN ioctl: " << ifr.ifr_name << endl;
-        return (false);
-        }
-
+    if (skt >= 0) return true;
+    const int candidate = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (candidate < 0) return false;
+    // Keep ownership local until every initialization operation succeeds.
+    const auto fail = [candidate]() {
+        const int error = errno;
+        ::close(candidate);
+        errno = error;
+        return false;
+    };
+    struct ifreq ifr = {};
+    struct sockaddr_can addr = {};
+    strncpy(ifr.ifr_name, _CANport, sizeof(ifr.ifr_name)-1);
+    if (ioctl(candidate, SIOCGIFINDEX, &ifr) < 0) return fail();
     addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
-    if (bind(skt, (struct sockaddr *)&addr, sizeof(addr)) < 0)  {
-        cerr << "Failed CAN bind" << endl;
-        return (false);
-        }
-
-
-    //----- Set socket for non-blocking
-    flags = fcntl(skt, F_GETFL, 0);
-    if (flags < 0) {
-        cerr << "Failed CAN flag fetch" << endl;
-        return (false);
-        }
-
-    if (fcntl(skt, F_SETFL, flags | O_NONBLOCK) < 0) {
-        cerr << "Failed CAN flag set" << endl;
-        return (false);
-        }
-
+    if (bind(candidate, (struct sockaddr *)&addr, sizeof(addr)) < 0) return fail();
+    const int flags = fcntl(candidate, F_GETFL, 0);
+    if (flags < 0) return fail();
+    if (fcntl(candidate, F_SETFL, flags | O_NONBLOCK) < 0) return fail();
+    skt = candidate;
     return true;
 }
 
 
 //*****************************************************************************
 bool tNMEA2000_SocketCAN::CANSendFrame(unsigned long id, unsigned char len, const unsigned char *buf, bool wait_sent) {
+   if (skt < 0) { errno = EBADF; return false; }
    struct can_frame frame_wr;
 
    frame_wr.can_id  = id | CAN_EFF_FLAG;
@@ -133,6 +120,7 @@ bool tNMEA2000_SocketCAN::CANSendFrame(unsigned long id, unsigned char len, cons
 
 //*****************************************************************************
 bool tNMEA2000_SocketCAN::CANGetFrame(unsigned long &id, unsigned char &len, unsigned char *buf) {
+    if (skt < 0) { errno = EBADF; return false; }
     struct can_frame frame_rd;
     struct timeval tv = {0, 0};                                                 // Non-blocking timout when checking
     fd_set fds;
